@@ -1,0 +1,25 @@
+[
+  {
+    "name": "x64-Release",
+    "generator": "Ninja",
+    "configurationType": "Release",
+    "inheritEnvironments": [ "msvc_x64_x64" ],
+    "cmakeCommandArgs": "",
+    "buildCommandArgs": "",
+    "ctestCommandArgs": "",
+    "variables": [
+      {
+        "name": "CMAKE_TOOLCHAIN_FILE",
+        "value": "C:/My_Files/Tools/vcpkg/scripts/buildsystems/vcpkg.cmake"
+      },
+      {
+        "name": "VCPKG_TARGET_TRIPLET",
+        "value": "x64-windows-static"
+      },
+      {
+        "name": "VCPKG_ROOT",
+        "value": "C:/My_Files/Tools/vcpkg"
+      }
+    ]
+  }
+]
