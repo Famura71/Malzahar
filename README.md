@@ -28,23 +28,8 @@ Note: Building with a static triplet reduces runtime dependencies.
 
 ## Secrets
 
-Secrets are loaded from the working directory instead of being hardcoded:
+Secrets are hardcoded. This made for being a security step. No one can run without the app 
 
-- `hmac.key` -> must match server `private.api.hmac-key`
-- `private_key.pem` -> RSA private key (PEM format, including BEGIN/END lines)
-
-If these files are missing, the app exits at startup.
-
-## Before Pushing To GitHub
-
-Do not commit `hmac.key` and `private_key.pem`.
-
-Example `.gitignore`:
-
-```gitignore
-hmac.key
-private_key.pem
-```
 
 ## Commands
 
