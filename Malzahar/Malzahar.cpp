@@ -18,6 +18,8 @@
 #include <csignal>
 #include <regex>
 #include <stdexcept>
+#include <cstring>   // memcpy
+#include <cstdint>   // uint32_t
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -38,9 +40,12 @@ const std::wstring TRANSFER_PATH = L"/api/private/transfer";
 const std::wstring TRANSFER_ZIP_PATH = L"/api/private/transfer/zip";
 const std::wstring PUSHZIP_PATH = L"/api/private/transfer/pushzip";
 const std::string EMBED_HMAC_KEY = "";
-const std::string EMBED_PRIVATE_KEY_PEM = "";
+const std::string EMBED_PRIVATE_KEY_PEM = R"(-----BEGIN RSA PRIVATE KEY-----
+
+-----END RSA PRIVATE KEY-----)";
 const std::string HMAC_KEY_FILE = "hmac.key";
 const std::string PRIVATE_KEY_FILE = "private_key.pem";
+const std::wstring ZIPCHUNK_PATH = L"/api/private/transfer/zipchunk";
 std::string g_hmac_key;
 std::string g_private_key_pem;
 
@@ -50,12 +55,22 @@ const std::string RSA_PUBLIC_KEY_B64 =
 
 volatile bool g_interrupted = false;
 void signalHandler(int) { g_interrupted = true; }
+static std::string strip_wrapping_quotes(const std::string& s);
+std::vector<unsigned char> aes_gcm_decrypt(
+    const std::vector<unsigned char>& key,
+    const std::vector<unsigned char>& iv,
+    const std::vector<unsigned char>& ciphertext,
+    const std::vector<unsigned char>& tag
+);
 
-static std::vector<std::string> split(const std::string& s) {
-    std::istringstream iss(s);
-    std::vector<std::string> out;
-    for (std::string tok; iss >> tok;) out.push_back(tok);
-    return out;
+static bool iequals_ascii(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (std::tolower(ca) != std::tolower(cb)) return false;
+    }
+    return true;
 }
 
 static std::string trim(const std::string& s) {
@@ -64,6 +79,355 @@ static std::string trim(const std::string& s) {
     size_t end = s.size();
     while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
     return s.substr(start, end - start);
+}
+static std::vector<std::string> split(const std::string& s) {
+    std::istringstream iss(s);
+    std::vector<std::string> out;
+    for (std::string tok; iss >> tok;) out.push_back(tok);
+    return out;
+}
+static void write_u32_le(std::vector<unsigned char>& out, uint32_t v) {
+    out.push_back((unsigned char)(v & 0xFF));
+    out.push_back((unsigned char)((v >> 8) & 0xFF));
+    out.push_back((unsigned char)((v >> 16) & 0xFF));
+    out.push_back((unsigned char)((v >> 24) & 0xFF));
+}
+static std::vector<unsigned char> aes_gcm_encrypt_chunk_binary(
+    const std::vector<unsigned char>& key,
+    const unsigned char* plain,
+    size_t plainLen
+) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    DWORD cbKeyObj = 0, cbData = 0, cbCipher = 0;
+
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (status != 0) throw std::runtime_error("BCryptOpenAlgorithmProvider failed");
+
+    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+        (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+    if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); throw std::runtime_error("BCryptSetProperty failed"); }
+
+    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObj, sizeof(cbKeyObj), &cbData, 0);
+    if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); throw std::runtime_error("BCryptGetProperty failed"); }
+
+    std::vector<unsigned char> keyObj(cbKeyObj);
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, keyObj.data(), cbKeyObj,
+        (PUCHAR)key.data(), (ULONG)key.size(), 0);
+    if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); throw std::runtime_error("BCryptGenerateSymmetricKey failed"); }
+
+    // iv(12) + tag(16)
+    std::vector<unsigned char> iv(12);
+    if (BCryptGenRandom(nullptr, iv.data(), (ULONG)iv.size(), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        BCryptDestroyKey(hKey); BCryptCloseAlgorithmProvider(hAlg, 0);
+        throw std::runtime_error("BCryptGenRandom(iv) failed");
+    }
+
+    std::vector<unsigned char> tag(16);
+    std::vector<unsigned char> cipher(plainLen);
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+    authInfo.pbNonce = (PUCHAR)iv.data();
+    authInfo.cbNonce = (ULONG)iv.size();
+    authInfo.pbTag = (PUCHAR)tag.data();
+    authInfo.cbTag = (ULONG)tag.size();
+    authInfo.pbAuthData = nullptr;
+    authInfo.cbAuthData = 0;
+
+    status = BCryptEncrypt(
+        hKey,
+        (PUCHAR)plain, (ULONG)plainLen,
+        &authInfo,
+        nullptr, 0,
+        cipher.data(), (ULONG)cipher.size(),
+        &cbCipher, 0
+    );
+
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (status != 0) throw std::runtime_error("BCryptEncrypt(GCM) failed");
+
+    cipher.resize(cbCipher);
+
+    // output = iv + cipher + tag
+    std::vector<unsigned char> out;
+    out.reserve(iv.size() + cipher.size() + tag.size());
+    out.insert(out.end(), iv.begin(), iv.end());
+    out.insert(out.end(), cipher.begin(), cipher.end());
+    out.insert(out.end(), tag.begin(), tag.end());
+    return out;
+}
+static std::string http_post_bytes(
+    const std::wstring& path,
+    const std::vector<unsigned char>& body,
+    const std::wstring& contentType = L"application/octet-stream"
+) {
+    HINTERNET hSession = WinHttpOpen(L"Malzahar/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return "";
+
+    HINTERNET hConnect = WinHttpConnect(hSession, HOST_W.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    WinHttpSetTimeouts(
+        hRequest,
+        30 * 1000,   // resolve
+        30 * 1000,   // connect
+        10 * 60 * 1000, // send 10 dk
+        10 * 60 * 1000  // receive 10 dk
+    );
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return ""; }
+
+    std::wstring headers = L"Content-Type: " + contentType + L"\r\n";
+    BOOL ok = WinHttpSendRequest(
+        hRequest,
+        headers.c_str(), (DWORD)-1,
+        (LPVOID)body.data(), (DWORD)body.size(),
+        (DWORD)body.size(), 0
+    );
+    if (ok) ok = WinHttpReceiveResponse(hRequest, nullptr);
+
+    std::string response;
+    if (ok) {
+        DWORD size = 0;
+        do {
+            DWORD downloaded = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &size)) break;
+            if (size == 0) break;
+            std::vector<char> buf(size + 1);
+            if (!WinHttpReadData(hRequest, buf.data(), size, &downloaded)) break;
+            buf[downloaded] = '\0';
+            response.append(buf.data(), downloaded);
+        } while (size > 0);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return response;
+}
+static std::vector<unsigned char> http_post_bytes_vec(
+    const std::wstring& path,
+    const std::vector<unsigned char>& body,
+    const std::wstring& contentType = L"application/octet-stream"
+) {
+    HINTERNET hSession = WinHttpOpen(L"Malzahar/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return {};
+
+    HINTERNET hConnect = WinHttpConnect(hSession, HOST_W.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return {}; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return {}; }
+
+    WinHttpSetTimeouts(hRequest, 30 * 1000, 30 * 1000, 10 * 60 * 1000, 10 * 60 * 1000);
+
+    std::wstring headers = L"Content-Type: " + contentType + L"\r\n";
+    BOOL ok = WinHttpSendRequest(
+        hRequest,
+        headers.c_str(), (DWORD)-1,
+        (LPVOID)body.data(), (DWORD)body.size(),
+        (DWORD)body.size(), 0
+    );
+    if (ok) ok = WinHttpReceiveResponse(hRequest, nullptr);
+
+    std::vector<unsigned char> response;
+    if (ok) {
+        DWORD size = 0;
+        do {
+            DWORD downloaded = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &size)) break;
+            if (size == 0) break;
+
+            size_t old = response.size();
+            response.resize(old + size);
+
+            if (!WinHttpReadData(hRequest, response.data() + old, size, &downloaded)) break;
+            response.resize(old + downloaded);
+        } while (size > 0);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return response;
+}
+
+static uint32_t read_u32_le(const unsigned char* p) {
+    return (uint32_t)p[0]
+        | ((uint32_t)p[1] << 8)
+        | ((uint32_t)p[2] << 16)
+        | ((uint32_t)p[3] << 24);
+}
+static bool pull_zip_in_chunks(
+    const std::filesystem::path& outZipPath,
+    const std::vector<unsigned char>& aesKey,
+    uint32_t totalChunks
+) {
+    // create/truncate
+    {
+        std::ofstream out(outZipPath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) throw std::runtime_error("cannot create temp zip for pull");
+    }
+
+    for (uint32_t idx = 0; idx < totalChunks; ++idx) {
+        int retryCount = 0;
+
+        while (true) {
+            try {
+                std::vector<unsigned char> req;
+                req.reserve(8);
+                write_u32_le(req, idx);
+                write_u32_le(req, totalChunks);
+
+                auto resp = http_post_bytes_vec(ZIPCHUNK_PATH, req, L"application/octet-stream");
+
+                // server error may return ASCII "2" or "2\n"
+                if (!resp.empty() && resp.size() <= 3) {
+                    std::string tiny(resp.begin(), resp.end());
+                    tiny = trim(tiny);
+                    if (tiny == "2") {
+                        throw std::runtime_error("server returned 2");
+                    }
+                }
+
+                if (resp.size() < 8 + 12 + 16) {
+                    throw std::runtime_error("invalid chunk response size");
+                }
+
+                uint32_t ridx = read_u32_le(resp.data());
+                uint32_t rtot = read_u32_le(resp.data() + 4);
+                if (ridx != idx || rtot != totalChunks) {
+                    throw std::runtime_error("chunk header mismatch");
+                }
+
+                size_t off = 8;
+
+                std::vector<unsigned char> iv(12);
+                memcpy(iv.data(), resp.data() + off, 12);
+                off += 12;
+
+                std::vector<unsigned char> tag(16);
+                memcpy(tag.data(), resp.data() + (resp.size() - 16), 16);
+
+                size_t ctLen = resp.size() - off - 16;
+                std::vector<unsigned char> ct(ctLen);
+                memcpy(ct.data(), resp.data() + off, ctLen);
+
+                std::vector<unsigned char> plain = aes_gcm_decrypt(aesKey, iv, ct, tag);
+
+                std::ofstream append(outZipPath, std::ios::binary | std::ios::app);
+                if (!append.is_open()) throw std::runtime_error("cannot append to temp zip");
+                append.write(reinterpret_cast<const char*>(plain.data()), (std::streamsize)plain.size());
+
+                std::cout << "pull chunk ok: " << (idx + 1) << "/" << totalChunks
+                    << " (plain=" << plain.size() << " bytes)\n";
+                break;
+            }
+            catch (const std::exception& ex) {
+                retryCount++;
+                std::cout << "pull chunk retry: idx=" << idx
+                    << " attempt=" << retryCount
+                    << " err=" << ex.what() << "\n";
+
+                if (retryCount >= 3) {
+                    std::cout << "pull aborted: chunk idx=" << idx << " failed 3 times\n";
+                    return false;
+                }
+                Sleep(400);
+            }
+        }
+    }
+
+    return true;
+}
+static bool push_zip_in_chunks(
+    const std::filesystem::path& zipPath,
+    const std::vector<unsigned char>& aesKey,
+    size_t plainChunkSizeBytes // ör: 90*1024*1024
+) {
+    auto fileSize = std::filesystem::file_size(zipPath);
+    uint32_t totalChunks = (uint32_t)((fileSize + plainChunkSizeBytes - 1) / plainChunkSizeBytes);
+
+    std::ifstream in(zipPath, std::ios::binary);
+    if (!in.is_open()) throw std::runtime_error("cannot open zip for streaming");
+
+    std::vector<unsigned char> plainBuf(plainChunkSizeBytes);
+
+    for (uint32_t idx = 0; idx < totalChunks; ++idx) {
+        // Retry için aynı chunk'ı tekrar okuyabilmek adına her denemede seek yapacağız
+        uint64_t offset = (uint64_t)idx * (uint64_t)plainChunkSizeBytes;
+
+        int retryCount = 0;
+        while (true) {
+            try {
+                in.clear();
+                in.seekg((std::streamoff)offset, std::ios::beg);
+                if (!in) throw std::runtime_error("seekg failed");
+
+                in.read((char*)plainBuf.data(), (std::streamsize)plainBuf.size());
+                std::streamsize got = in.gcount();
+                if (got <= 0) throw std::runtime_error("unexpected EOF while reading zip");
+
+                // encrypt chunk -> iv + ct + tag
+                auto enc = aes_gcm_encrypt_chunk_binary(aesKey, plainBuf.data(), (size_t)got);
+
+                // body: [idx(LE)][total(LE)] + enc(iv|ct|tag)
+                std::vector<unsigned char> body;
+                body.reserve(8 + enc.size());
+                write_u32_le(body, idx);
+                write_u32_le(body, totalChunks);
+                body.insert(body.end(), enc.begin(), enc.end());
+
+                std::string resp = trim(http_post_bytes(PUSHZIP_PATH, body));
+                if (resp == "0") {
+                    std::cout << "push chunk ok: " << (idx + 1) << "/" << totalChunks
+                        << " (plain=" << got << " bytes, body=" << body.size() << " bytes)\n";
+                    retryCount = 0; // aynı chunk başarılı oldu -> reset
+                    break;
+                }
+
+                retryCount++;
+                std::cout << "push chunk retry: idx=" << idx
+                    << " attempt=" << retryCount
+                    << " resp=" << resp << "\n";
+            }
+            catch (const std::exception& ex) {
+                retryCount++;
+                std::cout << "push chunk retry (exception): idx=" << idx
+                    << " attempt=" << retryCount
+                    << " err=" << ex.what() << "\n";
+            }
+
+            if (retryCount >= 3) {
+                std::cout << "push aborted: chunk idx=" << idx << " failed 3 times\n";
+                return false;
+            }
+
+            Sleep(400);
+        }
+    }
+
+    return true;
+}
+
+
+static std::string strip_wrapping_quotes(const std::string& s) {
+    std::string t = trim(s);
+    if (t.size() >= 2) {
+        char first = t.front();
+        char last = t.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            return t.substr(1, t.size() - 2);
+        }
+    }
+    return t;
 }
 
 static std::string read_text_file_or_empty(const std::filesystem::path& p) {
@@ -254,10 +618,54 @@ static std::string find_connected_path(const std::string& scope, const std::stri
     while (std::getline(infile, line)) {
         std::string t = trim(line);
         if (t.rfind(prefix, 0) == 0) {
-            return trim(t.substr(prefix.size()));
+            return strip_wrapping_quotes(t.substr(prefix.size()));
         }
     }
     return "";
+}
+
+struct ConnectedEntry {
+    std::string scope;   // canonical (dosyadaki)
+    std::string klasor;  // canonical
+    std::string path;    // canonical
+};
+
+static bool parse_paths_ini_line(const std::string& line, ConnectedEntry& out) {
+    std::string t = trim(line);
+    if (t.empty()) return false;
+
+    // format: Scope,KLASOR-Path
+    size_t comma = t.find(',');
+    if (comma == std::string::npos) return false;
+    size_t dash = t.find('-', comma + 1);
+    if (dash == std::string::npos) return false;
+
+    out.scope = trim(t.substr(0, comma));
+    out.klasor = trim(t.substr(comma + 1, dash - (comma + 1)));
+    out.path = strip_wrapping_quotes(t.substr(dash + 1));
+    return !(out.scope.empty() || out.klasor.empty() || out.path.empty());
+}
+
+static bool find_connected_entry_case_insensitive(
+    const std::string& scopeInput,
+    const std::string& klasorInput,
+    ConnectedEntry& found
+) {
+    std::filesystem::path iniPath = std::filesystem::current_path() / "paths.ini";
+    std::ifstream infile(iniPath);
+    if (!infile.is_open()) return false;
+
+    std::string line;
+    while (std::getline(infile, line)) {
+        ConnectedEntry e;
+        if (!parse_paths_ini_line(line, e)) continue;
+
+        if (iequals_ascii(e.scope, scopeInput) && iequals_ascii(e.klasor, klasorInput)) {
+            found = e; // canonical değerler + path
+            return true;
+        }
+    }
+    return false;
 }
 
 static int json_get_int_value(const std::string& json, const std::string& key) {
@@ -679,7 +1087,7 @@ int main() {
             size_t c2 = rest.find(',');
             if (c2 == std::string::npos) { std::cout << "connect failed: path is required\n"; continue; }
             std::string klasor = trim(rest.substr(0, c2));
-            std::string path = trim(rest.substr(c2 + 1));
+            std::string path = strip_wrapping_quotes(rest.substr(c2 + 1));
             if (path.empty()) { std::cout << "connect failed: path is required\n"; continue; }
             std::string data = scope + "/" + klasor;
             std::string resp = send_request("connect", logined_ad, logined_sifre, data);
@@ -713,13 +1121,15 @@ int main() {
             std::string scope = trim(params.substr(0, comma));
             std::string klasor = trim(params.substr(comma + 1));
 
-            std::string targetPathStr = find_connected_path(scope, klasor);
-            if (targetPathStr.empty()) {
+            ConnectedEntry entry;
+            if (!find_connected_entry_case_insensitive(scope, klasor, entry)) {
                 std::cout << "check failed: target path not found in paths.ini (run connect with path)\n";
                 continue;
             }
 
-            std::string data = scope + "/" + klasor;
+            // server'a canonical (ini'deki) scope/klasor gönder
+            std::string data = entry.scope + "/" + entry.klasor;
+
             std::string resp = send_request("check", logined_ad, logined_sifre, data);
             if (resp.rfind("0|", 0) == 0 && resp.size() > 2) {
                 std::cout << "Server response: 0 (Basarili) | " << resp.substr(2) << "\n";
@@ -741,81 +1151,91 @@ int main() {
             size_t c2 = rest.find(',');
             std::string klasor = (c2 == std::string::npos) ? rest : trim(rest.substr(0, c2));
             std::string version = (c2 == std::string::npos) ? "" : trim(rest.substr(c2 + 1));
-            std::string data = scope + "/" + klasor + (version.empty() ? "" : "/" + version);
 
-            std::string targetPathStr = find_connected_path(scope, klasor);
-            if (targetPathStr.empty()) {
+            ConnectedEntry entry;
+            if (!find_connected_entry_case_insensitive(scope, klasor, entry)) {
                 std::cout << "pull failed: target path not found in paths.ini (run connect with path)\n";
                 continue;
             }
 
+            // server'a canonical (ini'deki) scope/klasor + (varsa) versiyon gönder
+            std::string data = entry.scope + "/" + entry.klasor + (version.empty() ? "" : "/" + version);
+
             try {
-                // 1) pull yanitinin imzasini dogrula, 2) kalan RSA verisini private key ile ac.
                 std::string signedResp = send_request("pull", logined_ad, logined_sifre, data);
                 std::string resp = verify_and_decrypt_signed_payload(signedResp);
 
-                // Server response format: {"response":"0 aes key : <base64>"}
-                std::string response_value = json_get_value(resp, "response");
-                const std::string keyPrefix = "0 aes key : ";
-                if (response_value.rfind(keyPrefix, 0) == 0) {
-                    std::string aesKey_b64 = trim(response_value.substr(keyPrefix.size()));
-                    if (aesKey_b64.empty()) {
-                        std::cout << "pull failed: empty aes key\n";
+                // NEW JSON fields: {"response":"0","aes_key":"...","chunk_size":..., "total_chunks":..., "file_size":...}
+                std::string response_code = json_get_value(resp, "response");
+
+                // Backward compat fallback (old server): {"response":"0 aes key : <b64>"}
+                std::vector<unsigned char> aesKey;
+                uint32_t totalChunks = 0;
+
+                if (response_code == "0") {
+                    std::string aesKey_b64 = trim(json_get_value(resp, "aes_key"));
+                    int total = json_get_int_value(resp, "total_chunks");
+                    if (aesKey_b64.empty() || total <= 0) {
+                        std::cout << "pull failed: missing aes_key/total_chunks\n";
                         continue;
                     }
-                    std::vector<unsigned char> aesKey = base64_decode(aesKey_b64);
-
-                    // pull zip endpoint returns plaintext iv|ciphertext|tag (AES-GCM), not RSA/HMAC.
-                    std::string encdata_resp = http_post_raw(TRANSFER_ZIP_PATH, "pull", L"text/plain");
-
-                    size_t p1 = encdata_resp.find('|');
-                    size_t p2 = encdata_resp.find('|', p1 + 1);
-                    if (p1 == std::string::npos || p2 == std::string::npos) {
-                        std::cout << "pull failed: invalid zip payload format\n";
-                        continue;
-                    }
-                    std::string iv_b64 = encdata_resp.substr(0, p1);
-                    std::string ct_b64 = encdata_resp.substr(p1 + 1, p2 - p1 - 1);
-                    std::string tag_b64 = encdata_resp.substr(p2 + 1);
-                    std::vector<unsigned char> iv = base64_decode(iv_b64);
-                    std::vector<unsigned char> ct = base64_decode(ct_b64);
-                    std::vector<unsigned char> tag = base64_decode(tag_b64);
-                    std::vector<unsigned char> plain = aes_gcm_decrypt(aesKey, iv, ct, tag);
-
-                    std::filesystem::path targetPath = targetPathStr;
-                    std::filesystem::create_directories(targetPath);
-                    clear_directory_contents(targetPath);
-
-                    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-                    std::filesystem::path tempZip = std::filesystem::temp_directory_path() /
-                        ("malzahar_pull_" + std::to_string(now) + ".zip");
-
-                    {
-                        std::ofstream out(tempZip, std::ios::binary);
-                        if (!out.is_open()) {
-                            std::cout << "pull failed: cannot create temp zip file\n";
+                    aesKey = base64_decode(aesKey_b64);
+                    totalChunks = (uint32_t)total;
+                }
+                else {
+                    const std::string keyPrefix = "0 aes key : ";
+                    if (response_code.rfind(keyPrefix, 0) == 0) {
+                        std::string aesKey_b64 = trim(response_code.substr(keyPrefix.size()));
+                        if (aesKey_b64.empty()) {
+                            std::cout << "pull failed: empty aes key\n";
                             continue;
                         }
-                        out.write(reinterpret_cast<const char*>(plain.data()), static_cast<std::streamsize>(plain.size()));
-                    }
+                        aesKey = base64_decode(aesKey_b64);
 
-                    bool extracted = extract_zip_with_powershell(tempZip, targetPath);
-                    std::error_code ec;
-                    std::filesystem::remove(tempZip, ec);
-
-                    if (!extracted) {
-                        std::cout << "pull failed: zip extraction failed\n";
+                        // Old mode had single payload => totalChunks=1 and use /zip.
+                        // Ama senin hedefin chunk mode, burada istersen direkt hata verelim:
+                        std::cout << "pull failed: server is in old /zip mode, update server for chunk pull\n";
                         continue;
                     }
-
-                    std::string rootFolder = flatten_single_root_folder_if_needed(targetPath);
-                    std::string versionInfo = version.empty() ? (rootFolder.empty() ? "latest" : rootFolder) : version;
-                    std::cout << "pull ok: version=" << versionInfo
-                        << ", extracted to " << targetPath.string() << "\n";
-                } else {
-                    std::cout << format_server_response(resp) << "\n";
+                    else {
+                        std::cout << format_server_response(resp) << "\n";
+                        continue;
+                    }
                 }
-            } catch (const std::exception& ex) {
+
+                std::filesystem::path targetPath = entry.path; // canonical path
+                std::filesystem::create_directories(targetPath);
+                clear_directory_contents(targetPath);
+
+                auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+                std::filesystem::path tempZip = std::filesystem::temp_directory_path() /
+                    ("malzahar_pull_" + std::to_string(now) + ".zip");
+
+                std::cout << "pull: downloading zip in chunks ... total=" << totalChunks << "\n";
+                bool ok = pull_zip_in_chunks(tempZip, aesKey, totalChunks);
+                if (!ok) {
+                    std::error_code ec;
+                    std::filesystem::remove(tempZip, ec);
+                    std::cout << "pull failed: chunk download aborted\n";
+                    continue;
+                }
+
+                bool extracted = extract_zip_with_powershell(tempZip, targetPath);
+                std::error_code ec;
+                std::filesystem::remove(tempZip, ec);
+
+                if (!extracted) {
+                    std::cout << "pull failed: zip extraction failed\n";
+                    continue;
+                }
+
+                std::string rootFolder = flatten_single_root_folder_if_needed(targetPath);
+                std::string versionInfo = version.empty() ? (rootFolder.empty() ? "latest" : rootFolder) : version;
+
+                std::cout << "pull ok: version=" << versionInfo
+                    << ", extracted to " << targetPath.string() << "\n";
+            }
+            catch (const std::exception& ex) {
                 std::cout << "pull failed: " << ex.what() << "\n";
             }
             continue;
@@ -834,13 +1254,13 @@ int main() {
             std::string klasor = trim(rest.substr(0, c2));
             std::string version = trim(rest.substr(c2 + 1));
 
-            std::string targetPathStr = find_connected_path(scope, klasor);
-            if (targetPathStr.empty()) {
+            ConnectedEntry entry;
+            if (!find_connected_entry_case_insensitive(scope, klasor, entry)) {
                 std::cout << "manage failed: target path not found in paths.ini (run connect with path)\n";
                 continue;
             }
 
-            std::string data = scope + "/" + klasor + "/" + version;
+            std::string data = entry.scope + "/" + entry.klasor + "/" + version;
             std::string resp = send_request("manage", logined_ad, logined_sifre, data);
             std::cout << format_server_response(resp) << "\n";
             continue;
@@ -849,21 +1269,25 @@ int main() {
         if (cmd == "push") {
             if (logined_ad.empty() || logined_sifre.empty()) { std::cout << "please login first\n"; continue; }
             if (line.size() <= 5) { std::cout << "Usage: push <Public|Private>,<klasor>\n"; continue; }
+
             std::string params = trim(line.substr(5));
             size_t c1 = params.find(',');
             if (c1 == std::string::npos) { std::cout << "Usage: push <Public|Private>,<klasor>\n"; continue; }
+
             std::string scope = trim(params.substr(0, c1));
             std::string klasor = trim(params.substr(c1 + 1));
             if (scope.empty() || klasor.empty()) { std::cout << "Usage: push <Public|Private>,<klasor>\n"; continue; }
 
-            std::string targetPathStr = find_connected_path(scope, klasor);
-            if (targetPathStr.empty()) {
+            ConnectedEntry entry;
+            if (!find_connected_entry_case_insensitive(scope, klasor, entry)) {
                 std::cout << "push failed: target path not found in paths.ini (run connect with path)\n";
                 continue;
             }
 
+            std::filesystem::path tempZip;
+
             try {
-                std::filesystem::path sourcePath = targetPathStr;
+                std::filesystem::path sourcePath = entry.path; // canonical path
                 if (!std::filesystem::exists(sourcePath) || !std::filesystem::is_directory(sourcePath)) {
                     std::cout << "push failed: source path is missing or not a directory\n";
                     continue;
@@ -871,7 +1295,7 @@ int main() {
 
                 std::cout << "push: creating zip from " << sourcePath.string() << " ...\n";
                 auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-                std::filesystem::path tempZip = std::filesystem::temp_directory_path() /
+                tempZip = std::filesystem::temp_directory_path() /
                     ("malzahar_push_" + std::to_string(now) + ".zip");
 
                 if (!create_zip_with_powershell(sourcePath, tempZip)) {
@@ -879,47 +1303,43 @@ int main() {
                     continue;
                 }
 
-                std::cout << "push: encrypting zip payload ...\n";
-                std::vector<unsigned char> zipBytes = read_binary_file(tempZip);
+                std::cout << "push: preparing aes key ...\n";
+                std::vector<unsigned char> aesKey = generate_aes_key_256();
+                std::string aesKeyB64 = base64_encode(aesKey);
+
+                // server'a canonical (ini'deki) scope/klasor gönder
+                std::string pushData = entry.scope + "/" + entry.klasor + "/" + aesKeyB64;
+                std::string pushControlPayload = build_signed_request_payload("push", logined_ad, logined_sifre, pushData);
+
+                std::cout << "push: sending control payload ...\n";
+                std::string controlResp = trim(http_post_raw(TRANSFER_PATH, pushControlPayload));
+                if (controlResp != "0") {
+                    std::cout << "push failed: control step rejected, " << format_server_response(controlResp) << "\n";
+                    std::error_code ec;
+                    std::filesystem::remove(tempZip, ec);
+                    continue;
+                }
+
+                std::cout << "push: control ok, uploading zip in chunks ...\n";
+                const size_t CHUNK_SIZE = 80ull * 1024ull * 1024ull; // 80 MiB plaintext chunk
+                bool ok = push_zip_in_chunks(tempZip, aesKey, CHUNK_SIZE);
+
                 std::error_code ec;
                 std::filesystem::remove(tempZip, ec);
 
-                std::vector<unsigned char> aesKey = generate_aes_key_256();
-                std::string encryptedPayload = aes_gcm_encrypt_payload(aesKey, zipBytes);
-                std::string aesKeyB64 = base64_encode(aesKey);
-                std::string pushData = scope + "/" + klasor + "/" + aesKeyB64;
-                std::string pushControlPayload = build_signed_request_payload("push", logined_ad, logined_sifre, pushData);
-
-                g_last_push_aes_key = std::move(aesKey);
-                g_last_push_payload = std::move(encryptedPayload);
-                g_last_push_control_payload = std::move(pushControlPayload);
-                g_last_push_scope = scope;
-                g_last_push_klasor = klasor;
-                g_last_push_source_path = targetPathStr;
-
-                std::cout << "push precheck ok: encrypted payload prepared, key-len=" << g_last_push_aes_key.size()
-                    << ", payload-bytes=" << g_last_push_payload.size()
-                    << ", control-bytes=" << g_last_push_control_payload.size() << "\n";
-
-                std::cout << "push: sending control payload ...\n";
-                std::string controlResp = trim(http_post_raw(TRANSFER_PATH, g_last_push_control_payload));
-                if (controlResp != "0") {
-                    std::cout << "push failed: control step rejected, " << format_server_response(controlResp) << "\n";
+                if (!ok) {
+                    std::cout << "push failed: chunk upload aborted\n";
                     continue;
                 }
 
-                std::cout << "push: control step accepted, sending zip payload ...\n";
-                std::string zipResp = trim(http_post_raw(PUSHZIP_PATH, g_last_push_payload));
-                if (zipResp != "0") {
-                    std::cout << "push failed: zip upload rejected, " << format_server_response(zipResp) << "\n";
-                    continue;
-                }
-
-                std::cout << "push ok: zip uploaded successfully\n";
+                std::cout << "push ok: uploaded successfully\n";
             }
             catch (const std::exception& ex) {
                 std::cout << "push failed: " << ex.what() << "\n";
+                std::error_code ec;
+                if (!tempZip.empty()) std::filesystem::remove(tempZip, ec);
             }
+
             continue;
         }
 
